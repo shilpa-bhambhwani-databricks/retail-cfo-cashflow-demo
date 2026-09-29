@@ -1,0 +1,26 @@
+# Claude Code local (personal) settings — do not commit
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Data artifacts (generated locally; regenerate from scripts)
+*.parquet
+*.csv.gz
+data/generated/
+
+# Secrets / credentials — never commit
+*.pem
+*.token
+.env
+.databrickscfg
