@@ -1,5 +1,5 @@
 # Office of the CFO — Retail Cash-Flow Shortfall (Genie demo)
-
+This is a test-SMB
 A Databricks **Genie** demo for the "AI coworker for the Office of the CFO" blog
 storyline, retail-focused cut. **Company: Lakeview Retail** (omnichannel apparel).
 
