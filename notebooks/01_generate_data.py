@@ -1,31 +1,20 @@
-#!/usr/bin/env python
-# =====================================================================
-# Lakeview Retail — CFO Cash-Flow Shortfall demo — data generator
-#
-# Deterministic (seed=42). Builds 12 tables into
-#   serverless_stable_genie_cfo_catalog.lakeview_retail
-# via Databricks Connect (serverless), profile fe-vm-genie-cfo.
-#
-# PLANTED PROBLEM (reconciles exactly):
-#   Plan quarter-end cash (2026-12-31) = $30.0M
-#   Projected (forecast run 2026-11-05) = $22.0M  -> $8.0M shortfall
-#     INVENTORY_TRAP       -$3.5M  (aged Women's Outerwear FW25)
-#     COLLECTIONS_SLOWDOWN -$2.5M  ($1.7M wholesale disputes + $0.8M settlement slip)
-#     AP_ACCELERATION      -$2.0M  (early pay + lost discount + surcharge + expedite)
-#   Prior run (2026-10-22) projected $25.0M -> current run shows ~$3.0M
-#   deterioration in the last 2 weeks (level + velocity alert).
-#
-# OPERATIONAL RATIOS are velocity-controlled so they read believably:
-#   - Baseline categories: healthy sell-through / weeks-of-supply.
-#   - Women's Outerwear (the trap): the clear outlier (low sell-through,
-#     high weeks-of-supply, aged 90+, $3.5M trapped at cost).
-#   - Company DSO/DPO/DIO/CCC land in believable apparel ranges.
-#
-# Run:
-#   DATABRICKS_CONFIG_PROFILE=fe-vm-genie-cfo \
-#   uv run --with pandas --with numpy --with pyarrow \
-#          --with "databricks-connect>=15.1,<16.0" data/generate_data.py
-# =====================================================================
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # 01 · Generate Lakeview Retail data (Step 1)
+# MAGIC
+# MAGIC **Office of the CFO — Retail Cash-Flow Shortfall** demo. Deterministically
+# MAGIC (seed=42) builds 12 tables into `serverless_stable_genie_cfo_catalog.lakeview_retail`.
+# MAGIC
+# MAGIC **Planted problem (reconciles exactly):** quarter-end cash plan **$30M** →
+# MAGIC projected **$22M** = **$8M shortfall**, split **inventory-markdown $3.5M +
+# MAGIC collections/settlement $2.5M + supplier/AP $2.0M**, with ~$3M of the drop in
+# MAGIC the last 2 weeks. Operational ratios (DSO/DPO/DIO/CCC, sell-through) are
+# MAGIC velocity-controlled so only Women's Outerwear reads as the outlier.
+# MAGIC
+# MAGIC Run this notebook top-to-bottom on serverless. Then run `02_metric_views`.
+
+# COMMAND ----------
+
 import datetime as dt
 from collections import defaultdict
 import numpy as np
@@ -485,30 +474,48 @@ CASH_CATS = ["SALES_RECEIPTS", "WHOLESALE_COLLECTIONS", "SUPPLIER_PAYMENTS",
 
 
 def build_fact_cash_ledger():
-    """Daily actual cash in/out by category; running balance ends ~$28M at ALERT with a recent dip."""
-    days = pd.date_range(START, ALERT, freq="D").date
+    """Daily actual cash in/out by category. The end-of-day running balance follows a
+    realistic path: it builds to ~$30M by mid-2026, then drifts down to ~$25M by the
+    2026-11-05 alert as the shortfall takes hold. ai_forecast(version=>'1') on this recent
+    decline extrapolates to ~$22M at quarter-end, independently corroborating the authored
+    fact_cash_forecast. running_cash_balance is written as the end-of-day balance on every
+    category row, so a clean daily series (GROUP BY ledger_date) is trivial to forecast."""
+    def target_balance(d):
+        # piecewise: build 22M->30M to mid-2026, hold, then decline 30M->25M into the alert
+        if d <= dt.date(2026, 6, 30):
+            frac = (d - START).days / (dt.date(2026, 6, 30) - START).days
+            return 22_000_000.0 + frac * 8_000_000.0
+        if d <= dt.date(2026, 8, 31):
+            return 30_000_000.0
+        frac = (d - dt.date(2026, 8, 31)).days / (ALERT - dt.date(2026, 8, 31)).days
+        return 30_000_000.0 - frac * 5_000_000.0
+
+    IN_SPLIT = {"SALES_RECEIPTS": 0.74, "WHOLESALE_COLLECTIONS": 0.26}
+    OUT_SPLIT = {"SUPPLIER_PAYMENTS": 0.47, "PAYROLL": 0.20, "RENT": 0.07,
+                 "OTHER_OPEX": 0.16, "TAX": 0.06, "CAPEX": 0.04}
+    days = list(pd.date_range(START, ALERT, freq="D").date)
     rows = []
-    balance = 15_000_000.0
+    prev_bal = target_balance(START)
     for d in days:
-        seasonal = 1.0 + 0.15 * np.sin((d.timetuple().tm_yday / 365) * 2 * np.pi)
-        recent_dip = 0.85 if d >= dt.date(2026, 10, 22) else 1.0  # last 2 weeks softer
-        day_net = 0.0
+        seasonal = 1.0 + 0.06 * np.sin((d.timetuple().tm_yday / 365) * 2 * np.pi)
+        eod = target_balance(d) + float(rng.uniform(-120_000, 120_000))
+        net = eod - prev_bal
+        prev_bal = eod
+        recent_dip = 0.90 if d >= PRIOR_RUN else 1.0  # collections soften in the last 2 weeks
+        gross_in = float(rng.uniform(850_000, 1_050_000)) * seasonal * recent_dip
+        gross_out = gross_in - net
+        if gross_out < 0:                       # keep both sides non-negative
+            gross_in += -gross_out
+            gross_out = 0.0
+        bal = round(eod, 2)
         for cat in CASH_CATS:
-            if cat in ("SALES_RECEIPTS", "WHOLESALE_COLLECTIONS"):
-                cin = round(float(rng.uniform(150_000, 350_000)) * seasonal * recent_dip, 2)
-                cout = 0.0
+            if cat in IN_SPLIT:
+                cin = round(gross_in * IN_SPLIT[cat], 2); cout = 0.0
             else:
-                cin = 0.0
-                cout = round(float(rng.uniform(80_000, 220_000)) * seasonal, 2)
-            net = round(cin - cout, 2)
-            day_net += net
-            rows.append([d, cat, cin, cout, net, None])
-        balance += day_net
-        rows[-1][5] = round(balance, 2)
-    df = pd.DataFrame(rows, columns=["ledger_date", "cash_category", "cash_in_amt",
-                                     "cash_out_amt", "net_cash_amt", "running_cash_balance"])
-    df["running_cash_balance"] = df["running_cash_balance"].bfill().ffill()
-    return df
+                cin = 0.0; cout = round(gross_out * OUT_SPLIT[cat], 2)
+            rows.append([d, cat, cin, cout, round(cin - cout, 2), bal])
+    return pd.DataFrame(rows, columns=["ledger_date", "cash_category", "cash_in_amt",
+                                       "cash_out_amt", "net_cash_amt", "running_cash_balance"])
 
 
 def build_fact_cash_forecast():
@@ -562,7 +569,7 @@ TABLE_COMMENTS = {
     "fact_purchase_orders": "Purchase orders. Planted: oversized FW25 outerwear buy with OPEN lines still inbound; expedite/air-freight + tariff lines.",
     "fact_ap_payments": "Supplier payments (AP). Planted: ~$2.0M cash_impact_vs_plan from accelerated payments, lost discounts, tariff surcharge, expedited freight.",
     "fact_ar_invoices": "AR invoices. Planted: $1.7M wholesale disputes + $0.8M consumer settlement slippage = $2.5M; 2 flips in last 2 weeks.",
-    "fact_cash_ledger": "Daily actual cash in/out by category feeding ai_forecast(); recent weeks trend down.",
+    "fact_cash_ledger": "Daily actual cash in/out by category feeding ai_forecast(); end-of-day balance builds to ~$30M then declines to ~$25M by the 2026-11-05 alert (ai_forecast v1 projects ~$22M at quarter-end).",
     "fact_cash_forecast": "Rolling cash forecast by driver. Quarter-end 2026-12-31: plan $30M, projected $22M, variance -$8M (-3.5/-2.5/-2.0). Prior run 2026-10-22 projected $25M (~$3M 2-week deterioration).",
 }
 
@@ -584,10 +591,10 @@ COL_COMMENTS = {
                            "variance_amt": "projected - planned (negative = shortfall)"},
 }
 
+# COMMAND ----------
 
 def main():
-    from databricks.connect import DatabricksSession
-    spark = DatabricksSession.builder.profile("fe-vm-genie-cfo").serverless(True).getOrCreate()
+    # `spark` is the ambient session provided by the Databricks notebook.
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CAT}.{SCH}")
 
     sup = build_dim_supplier()
@@ -644,14 +651,14 @@ def main():
     print(f"  Prior-run projected       : ${prior:,.2f}  (target $25,000,000)")
     print(f"  2-week deterioration      : ${prior-proj:,.2f}  (target $3,000,000)")
 
-    print("\n=== OPERATIONAL RATIOS ===")
-    for r in spark.sql(f"SELECT * FROM {CAT}.{SCH}.v_working_capital_cycle").collect():
-        print(f"  DSO={r.dso_days}  DPO={r.dpo_days}  DIO={r.dio_days}  CCC={r.ccc_days}")
-    print("  sell-through / weeks-of-supply by category:")
-    for r in spark.sql(f"SELECT * FROM {CAT}.{SCH}.v_inventory_sell_through ORDER BY sell_through_rate").collect():
-        print(f"    {r.department:12s} {r.category:12s} ST={r.sell_through_rate:6}  WOS={r.weeks_of_supply:6}  onhand={r.on_hand_units}")
-    spark.stop()
+    print("\n=== OPERATIONAL RATIOS (requires the 02_metric_views notebook) ===")
+    try:
+        for r in spark.sql(f"SELECT * FROM {CAT}.{SCH}.v_working_capital_cycle").collect():
+            print(f"  DSO={r.dso_days}  DPO={r.dpo_days}  DIO={r.dio_days}  CCC={r.ccc_days}")
+        for r in spark.sql(f"SELECT * FROM {CAT}.{SCH}.v_inventory_sell_through ORDER BY sell_through_rate").collect():
+            print(f"    {r.department:12s} {r.category:12s} ST={r.sell_through_rate}  WOS={r.weeks_of_supply}")
+    except Exception:
+        print("  (views not created yet — run the 02_metric_views notebook, then re-run this cell)")
 
 
-if __name__ == "__main__":
-    main()
+main()
